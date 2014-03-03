@@ -36,6 +36,12 @@ void ConvolutionLayer<Dtype>::SetUp(const vector<Blob<Dtype>*>& bottom,
       << "Number of output should be multiples of group.";
   biasterm_ = this->layer_param_.biasterm();
   // Figure out the dimensions for individual gemms.
+  // M:number of output channel, or number of the filters, or the number of filter output channels.
+  // K:kernel size, number of pixels of each image patch size, or the filter size
+  // N:number of input patch, or number of input and output module
+  // the filter wieght matrix size is: M*K
+  // the input image patch matrix size is: K*N
+  // the ouput matrix size is: M*N
   M_ = NUM_OUTPUT_ / GROUP_;
   K_ = CHANNELS_ * KSIZE_ * KSIZE_ / GROUP_;
   N_ = height_out * width_out;
@@ -83,21 +89,44 @@ void ConvolutionLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
   Dtype* top_data = (*top)[0]->mutable_cpu_data();
   Dtype* col_data = col_buffer_.mutable_cpu_data();
   const Dtype* weight = this->blobs_[0]->cpu_data();
+  // RECALL:
+  // M: number of filter output channel
+  // K: size of a filter kernel, which is n_channels * ksize * ksize
+  // N: number of input image patch, which is height_out * width_out
+  // so, the filter matrix size is M*K, the image patch matrix size
+  // is K*N, the output matrix size is M*N
   int weight_offset = M_ * K_;
   int col_offset = K_ * N_;
   int top_offset = M_ * N_;
+  // for each input image
   for (int n = 0; n < NUM_; ++n) {
     // First, im2col
+    // convert all image patches of an input image into a single image patch matrix, 
+    // according to the conv param: kernel size, pad, stride. each column in the matrix
+    // is the data of an input image patch. total N column, K rows, where
+    // N is number of input image patch, K is filter module size.
     im2col_cpu(bottom_data + bottom[0]->offset(n), CHANNELS_, HEIGHT_,
                       WIDTH_, KSIZE_, PAD_, STRIDE_, col_data);
     // Second, innerproduct with groups
     for (int g = 0; g < GROUP_; ++g) {
+        // if not consider the group param, assume it is 0
+        // then the operation is:
+        // top_data = 1.0 * weight_matrix * image_patch_matrix + 0 * top_data
       caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasNoTrans, M_, N_, K_,
         (Dtype)1., weight + weight_offset * g, col_data + col_offset * g,
         (Dtype)0., top_data + (*top)[0]->offset(n) + top_offset * g);
     }
     // third, add bias
     if (biasterm_) {
+        // this->blobs_[1] is the bias term, which is a one-column-vector 
+        // has NUM_OUTPUT_ rows.
+        // bias_multiplier_ is a one-row-vector has N_ rows.
+        // (N = height_out * width_out, the number of input patch)
+        // the math operation is:
+        // top_data = 1.0 * bias(one-col) * bias_multiplier_(one-row) + 1.0 * top_data
+        // assume all elements in bias_multiplier_ is 1.0, then bias * bias_multiplier_
+        // means copy the bias-col-vector N times, to form a bias matrix. finally the
+        // bias matrix is added to the top_data.
       caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasNoTrans, NUM_OUTPUT_,
           N_, 1, (Dtype)1., this->blobs_[1]->cpu_data(),
           reinterpret_cast<const Dtype*>(bias_multiplier_->cpu_data()),
